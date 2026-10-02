@@ -290,13 +290,19 @@ class ADTopologyController(ProvisionedBackupTopologyController):
                 provider.fs.backup("/etc/resolv.conf")
                 provider.fs.write("/etc/resolv.conf", f"search {provider.domain}\nnameserver 127.0.0.1\n\n")
 
-        # Install Samba CA certificate so LDAPS tests can use it without per-test setup.
-        # Done before the provisioned check so it runs even on already-provisioned containers.
+        # Install the provider's CA certificate on the client so LDAPS tests can use it
+        # without per-test setup. Done before the provisioned check so it runs even on
+        # already-provisioned containers.
         if isinstance(provider, SambaHost):
             ca_cert_path = provider.config.get("ca_cert_path", "/var/data/certs/ca.crt")
             result = provider.conn.run(f"cat {ca_cert_path}", raise_on_error=False)
             if result.rc == 0 and result.stdout.strip():
                 OpenSSLUtils(client, client.fs).install_ca_cert(result.stdout)
+        elif isinstance(provider, ADHost):
+            try:
+                OpenSSLUtils(client, client.fs).install_ca_cert(provider.get_ca_cert())
+            except RuntimeError as e:
+                self.logger.warning(f"Unable to install AD CA certificate on {client.hostname}: {e}")
 
         if self.provisioned:
             self.logger.info(f"Topology '{self.name}' is already provisioned")

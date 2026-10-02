@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import textwrap
 from pathlib import PureWindowsPath
 from typing import Any
 
@@ -99,6 +100,74 @@ class ADHost(BaseDomainHost):
             self.__naming_context = nc
 
         return self.__naming_context
+
+    def get_ca_config(self) -> str:
+        """
+        Get the AD Certificate Services CA configuration string
+        (``hostname\\CA-name``) used by ``certreq``/``certutil -config``.
+
+        Falls back to a guessed ``hostname\\domain-CA`` value if the CA
+        configuration cannot be determined (e.g. AD CS is not installed).
+
+        :return: CA configuration string.
+        :rtype: str
+        """
+        result = self.conn.run("certutil -dump", raise_on_error=False)
+        if result.rc == 0:
+            for line in result.stdout_lines:
+                if "Config:" in line:
+                    return line.split(":", 1)[1].strip()
+
+        return f"{self.hostname}\\{self.domain}-CA"
+
+    def get_ca_cert(self) -> str:
+        """
+        Get the root CA certificate in PEM format from the Windows
+        certificate store.
+
+        Looks up the self-signed root CA certificate matching the AD CS
+        CA name in ``Cert:\\LocalMachine\\Root``. If AD CS is not installed
+        (or the root certificate is not found there), falls back to the
+        certificate in ``Cert:\\LocalMachine\\My`` matching the same name,
+        which covers self-signed DC certificates used for LDAPS without AD CS.
+
+        :return: Root CA certificate in PEM format.
+        :rtype: str
+        :raises RuntimeError: If the CA certificate cannot be retrieved.
+        """
+        ca_name = self.get_ca_config().split("\\", 1)[1].strip('"')
+        result = self.conn.run(
+            textwrap.dedent(f"""\
+                $ca = Get-ChildItem -Path Cert:\\LocalMachine\\Root | Where-Object {{
+                    $_.Subject -like '*CN={ca_name}*' -and $_.Issuer -eq $_.Subject
+                }} | Select-Object -First 1
+                if ($ca) {{
+                    [System.Convert]::ToBase64String($ca.Export('Cert'))
+                }} else {{
+                    $ca = Get-ChildItem -Path Cert:\\LocalMachine\\My | Where-Object {{
+                        $_.Subject -like '*CN={ca_name}*'
+                    }} | Select-Object -First 1
+                    if ($ca) {{
+                        [System.Convert]::ToBase64String($ca.Export('Cert'))
+                    }} else {{
+                        Write-Error "CA certificate not found"
+                        exit 1
+                    }}
+                }}
+            """),
+            raise_on_error=False,
+        )
+
+        if result.rc != 0:
+            raise RuntimeError(f"Failed to get CA certificate: {result.stderr}!")
+
+        ca_cert_b64 = result.stdout.strip()
+
+        if not ca_cert_b64:
+            raise RuntimeError("CA certificate not found in certificate stores!")
+
+        ca_cert_lines = [ca_cert_b64[i : i + 64] for i in range(0, len(ca_cert_b64), 64)]
+        return "-----BEGIN CERTIFICATE-----\n" + "\n".join(ca_cert_lines) + "\n-----END CERTIFICATE-----\n"
 
     def disconnect(self) -> None:
         return
